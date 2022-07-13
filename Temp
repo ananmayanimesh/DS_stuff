@@ -1,0 +1,159 @@
+@Component
+@Aspect
+public class CircuitBreakerAspects {
+
+    @Autowired
+    Resilience4jConfigs resilience4jConfigs;
+
+    private static final Logger log = LoggerFactory.getLogger(CircuitBreakerAspects.class);
+
+    @Around("@annotation(com.animesh.us.resil4j.CircuitBreakerOperations)")
+    public Object intercept(ProceedingJoinPoint pjp) throws Throwable {
+
+        CircuitBreakerOperations circuitBreakerOperations = getAnnotation(pjp);
+        String name = circuitBreakerOperations.name();
+
+        /**
+         Keeping the configs together
+         */
+        CircuitBreaker circuitBreaker = resilience4jConfigs.createCircuitBreakerDecorator(name);
+        TimeLimiter timeLimiter = resilience4jConfigs.createTimeLimiterDecorator(name);
+        ThreadPoolBulkhead threadPoolBulkhead = resilience4jConfigs.createThreadPoolBulkheadDecorator(name);
+
+        Supplier<Object> pjpSupplier = () -> {
+            Object obj = null;
+            try {
+                obj = pjp.proceed();
+            } catch (Throwable throwable) {
+                throw new ResourceAccessException("Unable to access Resource");
+            }
+            return obj;
+        };
+        log.info("Before = "+circuitBreaker.getMetrics().getNumberOfBufferedCalls() +" = "+ circuitBreaker.getMetrics().getNumberOfFailedCalls() + " = "+circuitBreaker.getState());
+
+        Object obj = Decorators.ofSupplier(pjpSupplier)
+                .withThreadPoolBulkhead(threadPoolBulkhead)
+                .withTimeLimiter(timeLimiter, Executors.newScheduledThreadPool(1))
+                .withCircuitBreaker(circuitBreaker)
+                .get()
+                .toCompletableFuture()
+                .get();
+
+        log.info("After = "+circuitBreaker.getMetrics().getNumberOfBufferedCalls() + " = "+circuitBreaker.getMetrics().getNumberOfFailedCalls() +" = "+ circuitBreaker.getState());
+
+        return obj;
+    }
+
+    private CircuitBreakerOperations getAnnotation(ProceedingJoinPoint pjp) {
+
+        MethodSignature methodSignature = (MethodSignature) pjp.getSignature();
+        Method method = methodSignature.getMethod();
+
+        return AnnotationUtils.getAnnotation(method, CircuitBreakerOperations.class);
+
+    }
+
+
+}
+
+
+
+======================================================================================
+
+
+@Component
+public class Resilience4jConfigs {
+
+    private static final HashMap<String,CircuitBreaker> circuitBreakerHashMap = new HashMap<>();
+    private static final HashMap<String,TimeLimiter> timeLimiterHashMap = new HashMap<>();
+    private static final HashMap<String,ThreadPoolBulkhead> bulkHeadHashMap = new HashMap<>();
+    Logger logger = LoggerFactory.getLogger(Resilience4jConfigs.class);
+
+
+    public CircuitBreaker createCircuitBreakerDecorator(String circuitName) {
+
+        if(circuitBreakerHashMap.containsKey(circuitName)){
+            logger.info("Existing circuit object config for "+circuitName);
+            return circuitBreakerHashMap.get(circuitName);
+        }else {
+            CircuitBreakerConfig circuitBreakerConfig = getCircuitBreakerConfig();
+            CircuitBreakerRegistry circuitBreakerRegistry = getCircuitBreakerRegistry(circuitBreakerConfig);
+            CircuitBreaker circuitBreaker = circuitBreakerRegistry.circuitBreaker(circuitName);
+            logger.info("New circuit object config for "+circuitName);
+            circuitBreakerHashMap.put(circuitName,circuitBreaker);
+            return circuitBreaker;
+        }
+
+    }
+
+    public TimeLimiter createTimeLimiterDecorator(String name) {
+
+        if(timeLimiterHashMap.containsKey(name)){
+            logger.info("Existing time object config for "+name);
+            return timeLimiterHashMap.get(name);
+        }
+        else {
+            TimeLimiterConfig config = getTimeLimiterConfig();
+            TimeLimiterRegistry timeLimiterRegistry = TimeLimiterRegistry.of(config);
+            TimeLimiter timeLimiter = timeLimiterRegistry.timeLimiter(name);
+            logger.info("New time object config for "+name);
+            timeLimiterHashMap.put(name,timeLimiter);
+            return timeLimiter;
+        }
+
+    }
+
+    public ThreadPoolBulkhead createThreadPoolBulkheadDecorator(String name){
+
+        if(bulkHeadHashMap.containsKey(name)){
+            logger.info("Existing bulkhead object config for "+name);
+            return bulkHeadHashMap.get(name);
+        }
+        else {
+            ThreadPoolBulkheadConfig bulkheadConfig = getBulkheadConfig();
+            ThreadPoolBulkheadRegistry threadPoolBulkheadRegistry = ThreadPoolBulkheadRegistry.of(bulkheadConfig);
+            ThreadPoolBulkhead threadPoolBulkhead = threadPoolBulkheadRegistry.bulkhead(name);
+            logger.info("New bulkhead object config for "+name);
+            bulkHeadHashMap.put(name,threadPoolBulkhead);
+            return threadPoolBulkhead;
+        }
+    }
+
+    private CircuitBreakerRegistry getCircuitBreakerRegistry(CircuitBreakerConfig circuitBreakerConfig) {
+        return CircuitBreakerRegistry.of(circuitBreakerConfig);
+    }
+
+    private CircuitBreakerConfig getCircuitBreakerConfig() {
+        CircuitBreakerConfig circuitBreakerConfig;
+        circuitBreakerConfig = CircuitBreakerConfig.custom()
+        .failureRateThreshold(30)
+        .enableAutomaticTransitionFromOpenToHalfOpen()
+        .minimumNumberOfCalls(3)
+        .automaticTransitionFromOpenToHalfOpenEnabled(true)
+        .waitDurationInOpenState(Duration.ofMillis(10000))
+        .permittedNumberOfCallsInHalfOpenState(3)
+        .slidingWindowSize(10)
+        .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+//                .ignoreExceptions(CommentedBusinessException.class)
+        .build();
+        return circuitBreakerConfig;
+    }
+
+    private TimeLimiterConfig getTimeLimiterConfig() {
+        return TimeLimiterConfig.custom()
+                .cancelRunningFuture(true)
+                .timeoutDuration(Duration.ofMillis(5000))
+                .build();
+    }
+
+    private ThreadPoolBulkheadConfig getBulkheadConfig() {
+        return ThreadPoolBulkheadConfig.custom()
+                .maxThreadPoolSize(500)
+                .coreThreadPoolSize(500)
+                .build();
+    }
+
+
+
+
+}
